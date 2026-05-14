@@ -4,6 +4,7 @@
 • 技术架构：采用 LangGraph 构建 ReAct 循环架构，后端使用 FastAPI 封装标准异步 API，前端基于 Streamlit 构建轻量级交互界面，整体服务基于 Docker 实现容器化部署。 
 
 • 核心功能与工程亮点： 
+
 o [智能体架构] Runtime Auditor 与自我纠错 突破单向链式调用限制，基于 LangGraph 设计多节点循环架构，创新性引入“运行时审计 (Auditor)”与“强制重写 (Rewriter)”机制。通过后置校验有效拦截 LLM 幻觉，确保输出的维修方案 100% 具备可追溯的参考来源 (Grounding)。 
 
 o [混合知识检索] 结构化与非结构化数据融合 封装 ChromaDB 实现维修手册的向量语义检索（基于 sentence-transformers）；结合 SQLite 实现设备运行状态的 SQL 关联查询。通过 Function Calling 动态路由，实现业务数据与外部知识的精准匹配。 
