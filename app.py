@@ -1,35 +1,42 @@
-import streamlit as st
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 from langchain_core.messages import AIMessage, HumanMessage
 
-from main_graph import app
+from main_graph import app as agent_graph
+from database_worker import init_db
+from rag_worker import init_rag
 
-st.title("IoT 智能运维 Agent")
+app = FastAPI()
 
-if "lc_messages" not in st.session_state:
-    st.session_state.lc_messages = []
-
-
-def _render_messages(messages: list) -> None:
-    """只展示用户与助手最终文本，跳过 ToolMessage 与带 tool_calls 的中间 AIMessage。"""
-    for msg in messages:
-        if isinstance(msg, HumanMessage):
-            with st.chat_message("user"):
-                st.markdown(msg.content)
-        elif isinstance(msg, AIMessage):
-            if msg.tool_calls:
-                continue
-            content = msg.content
-            text = content if isinstance(content, str) else str(content)
-            if text.strip():
-                with st.chat_message("assistant"):
-                    st.markdown(text)
+init_db()
+init_rag()
 
 
-_render_messages(st.session_state.lc_messages)
+class ChatRequest(BaseModel):
+    user_input: str
+    session_id: str = "default"
 
-if prompt := st.chat_input("小明，想聊点什么？"):
-    st.session_state.lc_messages.append(HumanMessage(content=prompt))
-    with st.spinner("思考中…"):
-        result = app.invoke({"messages": st.session_state.lc_messages})
-    st.session_state.lc_messages = result["messages"]
-    st.rerun()
+
+def _last_assistant_text(messages: list) -> str:
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage) and not msg.tool_calls:
+            c = msg.content
+            return c if isinstance(c, str) else str(c)
+    last = messages[-1]
+    c = getattr(last, "content", None)
+    if c is None:
+        return str(last)
+    return c if isinstance(c, str) else str(c)
+
+
+@app.post("/chat")
+async def chat_with_agent(request: ChatRequest):
+    # session_id 预留多轮；当前 Agent 为单轮 messages，仅使用本轮 user_input
+    try:
+        input_state = {"messages": [HumanMessage(content=request.user_input)]}
+        result = agent_graph.invoke(input_state)
+        final_reply = _last_assistant_text(result["messages"])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+    return {"reply": final_reply}
