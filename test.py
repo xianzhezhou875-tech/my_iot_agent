@@ -1,3 +1,11 @@
+import logging
+
+from logging_config import configure_logging
+
+configure_logging()
+logger = logging.getLogger(__name__)
+
+
 class SensorBuffer:
     def __init__(self):
         # 列表：存储所有记录（时间序）
@@ -12,7 +20,7 @@ class SensorBuffer:
         
         # 2. 存储到哈希表（字典）中，利用 Key 映射，如果存在则覆盖更新
         self.id_map[sensor_id] = value
-        print(f"记录已存入: {sensor_id} -> {value}")
+        logger.info("记录已存入: %s -> %s", sensor_id, value)
 
     def get_latest(self, sensor_id):
         # 利用字典的哈希查找特性，不需要遍历，直接通过 key 取值
@@ -26,14 +34,10 @@ class SensorBuffer:
 # --- 测试代码 ---
 if __name__ == "__main__":
     buffer = SensorBuffer()
-    
-    # 模拟数据采集
+
     buffer.add_record("Temp_01", 25.5)
     buffer.add_record("Humid_01", 60.2)
-    buffer.add_record("Temp_01", 26.1) # Temp_01 更新了
-    
-    # 瞬间查询最新值
-    print(f"Temp_01 最新温度: {buffer.get_latest('Temp_01')}")
-    
-    # 获取所有记录
-    print(f"所有历史记录: {buffer.get_history()}")
+    buffer.add_record("Temp_01", 26.1)
+
+    logger.info("Temp_01 最新温度: %s", buffer.get_latest("Temp_01"))
+    logger.info("所有历史记录: %s", buffer.get_history())

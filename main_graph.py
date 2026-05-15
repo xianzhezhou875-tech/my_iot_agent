@@ -1,3 +1,4 @@
+import logging
 from typing import TypedDict, Optional
 
 from langgraph.graph import StateGraph, END
@@ -10,6 +11,8 @@ from langchain_core.messages import HumanMessage, ToolMessage, AIMessage
 from database_worker import query_user_device_tool
 from llm_factory import create_deepseek_brain, AUDITOR_PROMPT
 from rag_worker import query_repair_manual_tool
+
+logger = logging.getLogger(__name__)
 
 
 class AgentState(TypedDict):
@@ -50,18 +53,22 @@ def node_audit_answer(state: AgentState) -> Command:
     messages = state["messages"]
     tool_ref = _last_tool_result_text(messages)
     if not tool_ref:
+        logger.debug("审计跳过：messages 中无工具结果")
         return Command(goto=END)
 
     final_answer = _last_assistant_reply_text(messages)
     if not final_answer.strip():
+        logger.debug("审计跳过：无助手最终文本")
         return Command(goto=END)
 
     brain = create_deepseek_brain()
     prompt = AUDITOR_PROMPT.format(rag_info=tool_ref, final_answer=final_answer)
     res = brain.invoke(prompt)
     audit = res.content.strip().upper()
+    logger.debug("审计结果: %s", audit)
     if audit == "PASS":
         return Command(goto=END)
+    logger.info("审计未通过，进入 rewriter")
     return Command(goto="rewriter")
 
 
@@ -112,6 +119,9 @@ app = workflow.compile()
 
 
 if __name__ == "__main__":
+    from logging_config import configure_logging
+
+    configure_logging()
     from database_worker import init_db
     from rag_worker import init_rag
 
@@ -125,4 +135,5 @@ if __name__ == "__main__":
         )
     )
     result = app.invoke({"messages": [msg]})
-    print("AI 回复:", result["messages"][-1].content)
+    last = result["messages"][-1].content
+    logger.info("AI 回复: %s", last if isinstance(last, str) else str(last))

@@ -1,5 +1,9 @@
+import logging
 import sqlite3
 from langchain_core.tools import tool
+
+logger = logging.getLogger(__name__)
+
 
 def init_db():
     conn = sqlite3.connect("my_ai_data.db")
@@ -23,11 +27,13 @@ def init_db():
 
     conn.commit()
     conn.close()
+    logger.info("SQLite 已就绪: my_ai_data.db")
+
 
 @tool
 def query_user_device_tool(name: str):
     """当需要查询特定用户名下拥有的 IoT 设备名称时，调用此工具。"""
-    # 逻辑：建立连接 -> 查表 -> 返回结果
+    logger.debug("query_user_device_tool: name=%r", name)
     conn = sqlite3.connect("my_ai_data.db")
     cursor = conn.cursor()
 

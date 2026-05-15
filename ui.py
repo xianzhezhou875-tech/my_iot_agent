@@ -1,6 +1,13 @@
+import logging
+
+from logging_config import configure_logging
+
+configure_logging()
+logger = logging.getLogger(__name__)
+
+import requests
 import streamlit as st
 from langchain_core.messages import AIMessage, HumanMessage
-import requests
 
 st.title("IoT 智能运维 Agent")
 
@@ -35,7 +42,7 @@ def _render_messages(messages: list) -> None:
                             # 放入折叠块中
                             with st.expander("查看参考维修手册"):
                                 st.info("【资料来源:" + source_part)
-                        except:
+                        except Exception:
                             # 如果拆分失败，就当普通文本显示
                             st.markdown(text)
                     else:
@@ -53,9 +60,20 @@ if prompt := st.chat_input("小明，想聊点什么？"):
                 json={"user_input": prompt},
                 timeout=120,
             )
-            response.raise_for_status()
-            reply = response.json().get("reply", "")
+        try:
+            body = response.json()
+        except ValueError:
+            body = {}
+        if not response.ok:
+            err = body.get("error") if isinstance(body, dict) else None
+            msg = err or response.text or f"HTTP {response.status_code}"
+            logger.warning("后端返回错误 status=%s body=%s", response.status_code, body)
+            st.error(msg)
+            st.session_state.lc_messages.pop()
+            st.stop()
+        reply = body.get("reply", "") if isinstance(body, dict) else ""
     except requests.RequestException as e:
+        logger.warning("请求后端失败: %s", e, exc_info=True)
         st.error(f"请求后端失败（请先启动 uvicorn）：{e}")
         st.session_state.lc_messages.pop()
         st.stop()
@@ -63,12 +81,3 @@ if prompt := st.chat_input("小明，想聊点什么？"):
     text = reply if isinstance(reply, str) else str(reply)
     st.session_state.lc_messages.append(AIMessage(content=text))
     st.rerun()
-    # ui.py 中
-# ... 
-        # 获取回复
-    reply_text = response.json()["reply"]
-        
-        # --- 加上这一行，看看后台到底收到了什么 ---
-    print(f"DEBUG: Agent 返回的内容是: {reply_text}")
-        
-        # ...

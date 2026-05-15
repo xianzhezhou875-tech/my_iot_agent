@@ -1,17 +1,32 @@
+import logging
 import os
+
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 
+logger = logging.getLogger(__name__)
+
+# 尽早加载 .env，保证 LangSmith / DeepSeek 等变量在首次读 os.environ 前可用
+load_dotenv()
+if os.getenv("LANGSMITH_TRACING", "").lower() in ("true", "1"):
+    _proj = os.getenv("LANGSMITH_PROJECT") or os.getenv("LANGCHAIN_PROJECT") or "default"
+    logger.info("LangSmith 追踪已开启，项目名: %s", _proj)
+
+
 def create_deepseek_brain():
     load_dotenv()
-    # 逻辑：生产一个严谨的 (temp=0) 的模型实例
+    if not os.getenv("DEEPSEEK_API_KEY"):
+        logger.warning("未设置环境变量 DEEPSEEK_API_KEY，模型请求可能失败")
     model = ChatOpenAI(
-        model='deepseek-chat',
+        model="deepseek-chat",
         openai_api_key=os.getenv("DEEPSEEK_API_KEY"),
-        openai_api_base='https://api.deepseek.com',
-        temperature=0
+        openai_api_base="https://api.deepseek.com",
+        temperature=0,
+        timeout=120.0,
+        max_retries=0,
     )
     return model
+
 
 # 逻辑：定义质检员的思维方式
 AUDITOR_PROMPT = """
