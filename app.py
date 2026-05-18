@@ -51,8 +51,12 @@ except ImportError:
     before_sleep=before_sleep_log(logger, logging.WARNING),
     reraise=True,
 )
-def _invoke_agent_graph_with_retry(input_state: dict[str, Any]) -> dict[str, Any]:
-    return agent_graph.invoke(input_state)
+def _invoke_agent_graph_with_retry(
+    input_state: dict[str, Any],
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    run_config = config or {"recursion_limit": 30}
+    return agent_graph.invoke(input_state, config=run_config)
 
 
 app = FastAPI(title="IoT Agent API")
@@ -108,7 +112,10 @@ async def chat_with_agent(request: ChatRequest):
         request.session_id,
         len(request.user_input or ""),
     )
-    input_state = {"messages": [HumanMessage(content=request.user_input)]}
+    input_state = {
+        "messages": [HumanMessage(content=request.user_input)],
+        "rewrite_count": 0,
+    }
     try:
         result = _invoke_agent_graph_with_retry(input_state)
     except _retryable_types as e:  # type: ignore[misc]
