@@ -1,32 +1,69 @@
-import logging
+"""
+LLM 模型工厂 — DeepSeek 统一入口 & Prompt 模板定义。
+
+对外暴露：
+  - create_deepseek_brain()  → 返回 ChatOpenAI 实例（对接 DeepSeek API）
+  - SUPERVISOR_PROMPT        → 经理路由 Prompt
+  - DEVICE_AGENT_SYSTEM       → 设备专家系统 Prompt
+  - MANUAL_AGENT_SYSTEM       → 手册专家系统 Prompt
+  - AUDITOR_PROMPT            → 审计质检 Prompt 模板
+"""
+
 import os
 
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 
-logger = logging.getLogger(__name__)
+from logging_config import logger
 
 # 尽早加载 .env，保证 LangSmith / DeepSeek 等变量在首次读 os.environ 前可用
 load_dotenv()
+
 if os.getenv("LANGSMITH_TRACING", "").lower() in ("true", "1"):
-    _proj = os.getenv("LANGSMITH_PROJECT") or os.getenv("LANGCHAIN_PROJECT") or "default"
+    _proj = (
+        os.getenv("LANGSMITH_PROJECT")
+        or os.getenv("LANGCHAIN_PROJECT")
+        or "default"
+    )
     logger.info("LangSmith 追踪已开启，项目名: %s", _proj)
 
 
-def create_deepseek_brain():
-    load_dotenv()
-    if not os.getenv("DEEPSEEK_API_KEY"):
-        logger.warning("未设置环境变量 DEEPSEEK_API_KEY，模型请求可能失败")
-    model = ChatOpenAI(
-        model="deepseek-chat",
-        openai_api_key=os.getenv("DEEPSEEK_API_KEY"),
-        openai_api_base="https://api.deepseek.com",
-        temperature=0,
-        timeout=120.0,
-        max_retries=0,
-    )
-    return model
+def create_deepseek_brain() -> ChatOpenAI:
+    """
+    创建 DeepSeek Chat 模型实例。
 
+    通过 ChatOpenAI 兼容接口对接 DeepSeek API：
+      - 模型: deepseek-chat
+      - 温度: 0（确定性输出，适合结构化任务）
+      - 超时: 120s（LLM 推理耗时较长，避免误杀）
+      - max_retries: 0（重试由上层 app.py 的 tenacity 统一控制）
+
+    Raises:
+        RuntimeError: API Key 未设置或模型初始化失败时抛出。
+    """
+    load_dotenv()
+    api_key = os.getenv("DEEPSEEK_API_KEY")
+    if not api_key:
+        logger.error("环境变量 DEEPSEEK_API_KEY 未设置，模型请求将失败")
+        raise RuntimeError("DEEPSEEK_API_KEY 未设置")
+
+    try:
+        model = ChatOpenAI(
+            model="deepseek-chat",
+            openai_api_key=api_key,
+            openai_api_base="https://api.deepseek.com",
+            temperature=0,
+            timeout=120.0,
+            max_retries=0,
+        )
+        logger.debug("DeepSeek Chat 模型实例已创建")
+        return model
+    except Exception:
+        logger.exception("创建 ChatOpenAI 实例失败")
+        raise
+
+
+# ── Prompt 模板 ─────────────────────────────────────────────────
 
 SUPERVISOR_PROMPT = """你是一个 IoT 运维调度中心经理，只负责分析用户意图并选择专家，不亲自查库、不检索手册。
 
@@ -50,7 +87,6 @@ MANUAL_AGENT_SYSTEM = """你是 IoT 维修手册专家（Manual Worker），只�
 2. 回答须基于工具返回内容；可在文末注明【资料来源: ...】引用检索片段。
 3. 不要查询用户设备清单（那是 Device 专家的职责）。"""
 
-# 逻辑：定义质检员的思维方式
 AUDITOR_PROMPT = """
 你是一个严谨的 AI 审计员。核对【AI回答】是否与【参考资料】一致，并允许合理推断。
 
