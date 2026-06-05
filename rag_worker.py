@@ -1,10 +1,12 @@
 """
-RAG 工作器 — 向量知识库查询引擎。
+RAG 工作器 — 工业级 Hybrid RAG 铁三角检索引擎。
 
-高级 RAG 三大组件流水线：
-  1. 查询改写 (Query Rewriting)    — 清洗 & 规范化用户输入
-  2. 混合检索 (Hybrid Search)      — 语义向量 + 关键词字面双路召回
-  3. Top-K 重排 (Re-ranking)       — 按向量距离排序 + 截断最优 K 条
+检索流水线 (5 段式)：
+  1. 查询改写 (Query Rewriting)         — 清洗 & 规范化用户输入
+  2. BM25 关键词检索 (Sparse/Lexical)   — Okapi BM25 精确字面匹配
+  3. ChromaDB 语义向量检索 (Dense)      — SentenceTransformer embedding
+  4. RRF 倒数排序融合 (Reciprocal Rank Fusion) — 双路结果无量纲化合并去重
+  5. BGE Reranker 交叉注意力重排        — Cross-Attention 精排 → Top-3
 
 对外暴露：
   - init_rag()                  → 初始化知识库 & 插入示例文档
@@ -16,17 +18,22 @@ from functools import lru_cache
 from pathlib import Path
 
 import chromadb
+import numpy as np
 from chromadb.utils import embedding_functions
 from langchain_core.tools import tool
+from rank_bm25 import BM25Okapi
+from sentence_transformers import CrossEncoder
 
 from logging_config import logger
 
 # ── 常量 ───────────────────────────────────────────────────────
 _RAG_DIR = Path(__file__).resolve().parent / "my_rag_db"
 _MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
+_RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"  # BGE 多语言 Cross-Attention 重排模型
 _MAX_DISTANCE = float(os.environ.get("RAG_MAX_DISTANCE", "0.6"))
 _TOP_K = int(os.environ.get("RAG_TOP_K", "3"))          # 重排后保留的最优文档数
 _HYBRID_N_RESULTS = int(os.environ.get("RAG_HYBRID_N", "5"))  # 混合检索每路召回数
+_RRF_K = int(os.environ.get("RAG_RRF_K", "60"))        # RRF 平滑常数
 
 
 # ── 懒加载基础设施 ─────────────────────────────────────────────
@@ -98,99 +105,215 @@ def _rewrite_query(question: str) -> str:
     return rewritten
 
 
-def _hybrid_search(
-    collection, query_text: str, n_results: int = _HYBRID_N_RESULTS
+def _bm25_search(
+    corpus: list[str], query_text: str, n_results: int = _HYBRID_N_RESULTS
 ) -> list[str]:
     """
-    【组件2 — 混合检索】Hybrid Search /ˈhaɪbrɪd sɜːrtʃ/
+    【组件2a — BM25 关键词检索】Sparse / Lexical Retrieval
 
-    双路召回 → 合并去重，弥补单路向量检索的盲区：
-
-      Path A — 语义向量检索（Dense）:
-        用 embedding 模型把查询变成向量，在向量空间找最近的邻居。
-        擅长：同义词、近义表达（"坏了"≈"故障"≈"异常"）。
-        盲区：精确关键词（如型号"ESP32-S3"）会被平滑掉。
-
-      Path B — 关键词字面匹配（Sparse/Lexical）:
-        同样走 ChromaDB query（它内部有 TF-IDF 相关的字面匹配逻辑）。
-        擅长：精确术语、型号、错误码。
-        盲区：无法理解同义表达。
-
-      合并策略：向量结果在前 + 关键词结果在后，按首次出现去重。
-
-    大白话：一条腿走语义（懂意思），一条腿走关键词（认字面），
-    两条腿走路比一条腿稳。
+    基于 Okapi BM25 算法对全量文档做字面级匹配排序。
+    擅长：精确型号（ESP32-S3）、错误码（E404）、硬编码特征（V1/V2）。
 
     Args:
-        collection: ChromaDB collection 对象
-        query_text: 改写后的查询文本
-        n_results: 每路召回数量
+        corpus:      全量文档文本列表
+        query_text:  改写后的查询词
+        n_results:   返回 Top-N 条
 
     Returns:
-        去重合并后的文档列表（向量结果优先）
+        按 BM25 分数降序排列的文档列表（仅返回 score > 0 的结果）。
     """
+    if not corpus:
+        return []
     try:
-        # Path A: 语义向量检索
-        vec_results = collection.query(query_texts=[query_text], n_results=n_results)
-        vec_docs = vec_results.get("documents", [[]])[0] if vec_results else []
-
-        # Path B: 关键词字面检索（复用 query，ChromaDB 内部有词袋/稀疏特征）
-        kw_results = collection.query(query_texts=[query_text], n_results=n_results)
-        kw_docs = kw_results.get("documents", [[]])[0] if kw_results else []
-
-        # 合并 + 去重（保持向量结果优先的顺序）
-        seen: set[str] = set()
-        merged: list[str] = []
-        for doc in vec_docs + kw_docs:
-            if doc and doc not in seen:
-                seen.add(doc)
-                merged.append(doc)
-
-        logger.debug(
-            "混合检索完成 — 向量召回=%d 关键词召回=%d 合并去重=%d",
-            len(vec_docs), len(kw_docs), len(merged),
-        )
-        return merged
-
+        tokenized_corpus = [doc.split() for doc in corpus]
+        bm25 = BM25Okapi(tokenized_corpus)
+        tokenized_query = query_text.split()
+        scores = bm25.get_scores(tokenized_query)
+        ranked_indices = np.argsort(scores)[::-1]
+        ranked = [
+            corpus[i] for i in ranked_indices[:n_results] if scores[i] > 0
+        ]
+        logger.debug("BM25 召回=%d (语料=%d)", len(ranked), len(corpus))
+        return ranked
     except Exception:
-        logger.exception("混合检索异常，query=%r", query_text[:80])
+        logger.exception("BM25 检索异常 — query=%r", query_text[:80])
         return []
 
 
-def _rerank_by_distance(
-    documents: list[str], distances: list[float], top_k: int = _TOP_K
-) -> list[str]:
+def _hybrid_search(
+    collection, query_text: str, n_results: int = _HYBRID_N_RESULTS
+) -> dict[str, list[str]]:
     """
-    【组件3 — Top-K 重排】Re-ranking /riːˈræŋkɪŋ/
+    【组件2b — 真·双路混合检索】Hybrid Search /ˈhaɪbrɪd sɜːrtʃ/
 
-    将候选文档按向量距离升序排列 → 截取前 K 个最优结果。
+    Path A — BM25Okapi 关键词字面检索（Sparse/Lexical）
+    Path B — ChromaDB 语义向量检索（Dense）
 
-    核心逻辑：
-      - ChromaDB 返回的 distance 越小 = 语义越近 = 越相关
-      - 按距离升序排列，取前 top_k 个
-      - 丢弃剩余低质量结果，减少下游噪声
-
-    Args:
-        documents: 候选文档列表
-        distances:  对应的向量距离列表（与 documents 等长）
-        top_k:      保留的最优条数
+    两路独立并行，各自按得分/距离排序，不在此层合并。
+    合并交由下游 RRF 融合器完成。
 
     Returns:
-        重排后的 top_k 文档列表
+        {"bm25": [doc_ranked...], "vector": [doc_ranked...]}
+    """
+    try:
+        # Path A: BM25 关键词 — 从 collection 拉全量语料建索引
+        all_data = collection.get()
+        corpus = all_data.get("documents", []) if all_data else []
+        bm25_ranked = _bm25_search(corpus, query_text, n_results)
+
+        # Path B: ChromaDB 语义向量检索
+        vec_results = collection.query(query_texts=[query_text], n_results=n_results)
+        vec_ranked = vec_results.get("documents", [[]])[0] if vec_results else []
+        vec_ranked = [d for d in vec_ranked if d]
+
+        logger.debug(
+            "双路检索 — BM25=%d | 向量=%d",
+            len(bm25_ranked), len(vec_ranked),
+        )
+        return {"bm25": bm25_ranked, "vector": vec_ranked}
+
+    except Exception:
+        logger.exception("混合检索异常 — query=%r", query_text[:80])
+        return {"bm25": [], "vector": []}
+
+
+def _rrf_fusion(
+    ranked_lists: dict[str, list[str]], k: int = _RRF_K
+) -> list[str]:
+    """
+    【组件3 — RRF 倒数排序融合】Reciprocal Rank Fusion
+    /rɪˈsɪprəkəl ræŋk ˈfjuːʒən/
+
+    将 BM25 和 Vector 两路排序结果做无量纲化加权合并。
+
+    公式：
+      RRF(d) = Σ 1 / (k + rank_i(d))
+
+    其中 k 是平滑常数（默认 60），rank_i 是文档 d 在第 i 路检索中的
+    排名（1-indexed）。k 的作用是压制排名末尾文档的噪声权重。
+
+    大白话：
+      "传感器正常范围 20-30" 这句话 ——
+      BM25 能精确匹配"20-30"的数字面 → 可能排第 1
+      Vector 能理解"正常范围"≈"工作区间"的语义 → 可能排第 2
+      RRF 综合两路排名：1/(60+1) + 1/(60+2) = 0.0164 + 0.0161 = 0.0325
+      比单纯只看一路更可靠。
+
+    Args:
+        ranked_lists: {"bm25": [doc_ranked...], "vector": [doc_ranked...]}
+        k:            平滑常数
+
+    Returns:
+        按 RRF 分数降序排列的去重文档列表。
+    """
+    bm25_docs = ranked_lists.get("bm25", [])
+    vec_docs = ranked_lists.get("vector", [])
+
+    if not bm25_docs and not vec_docs:
+        return []
+
+    scores: dict[str, float] = {}
+
+    # BM25 路
+    for rank, doc in enumerate(bm25_docs, start=1):
+        scores[doc] = scores.get(doc, 0.0) + 1.0 / (k + rank)
+
+    # Vector 路
+    for rank, doc in enumerate(vec_docs, start=1):
+        scores[doc] = scores.get(doc, 0.0) + 1.0 / (k + rank)
+
+    # 按 RRF 分数降序
+    sorted_docs = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+
+    logger.debug(
+        "RRF 融合 — BM25=%d 向量=%d → 去重=%d 最高分=%.4f",
+        len(bm25_docs), len(vec_docs), len(sorted_docs),
+        sorted_docs[0][1] if sorted_docs else 0.0,
+    )
+    return [doc for doc, _ in sorted_docs]
+
+
+# ── BGE Reranker（懒加载） ──────────────────────────────────────
+
+
+@lru_cache(maxsize=1)
+def _get_reranker_model() -> CrossEncoder:
+    """
+    懒加载 BGE Reranker Cross-Encoder 模型。
+
+    BAAI/bge-reranker-v2-m3 是多语言 Cross-Attention 重排模型，
+    对 (query, document) 对计算交叉注意力得分，比向量距离更精准。
+
+    首次调用从 HuggingFace 拉取（约 1.2GB），后续命中 LRU 缓存。
+    """
+    try:
+        logger.info("正在加载 BGE Reranker 模型: %s", _RERANKER_MODEL)
+        model = CrossEncoder(_RERANKER_MODEL, max_length=512)
+        logger.info("BGE Reranker 模型加载完成 — max_length=512")
+        return model
+    except Exception:
+        logger.exception("BGE Reranker 模型 %s 加载失败", _RERANKER_MODEL)
+        raise RuntimeError(f"无法加载 BGE Reranker 模型 {_RERANKER_MODEL}") from None
+
+
+def _cross_encoder_rerank(
+    query: str, documents: list[str], top_k: int = _TOP_K
+) -> list[tuple[str, float]]:
+    """
+    【组件4 — Cross-Attention 交叉注意力重排】
+    Cross-Encoder Re-ranking /krɒs ɪnˈkəʊdə riːˈræŋkɪŋ/
+
+    BGE Reranker 对每个候选 (query, doc) 对独立计算交叉注意力得分，
+    精确衡量语义相关性，解决 Lost in the Middle 效应。
+
+    流程：
+      1. 构造 (query, doc_i) 对列表
+      2. CrossEncoder 批量计算 relevance scores
+      3. 按得分降序排列
+      4. 截断保留 Top-K 核心 Chunk
+
+    大白话：向量检索看的是"整体方向是不是一致"，
+    Cross-Attention 看的是"每个词之间的细粒度交互关系"。
+    前者快但粗糙，后者慢但精准——所以先用前者粗筛，再用后者精排。
+
+    Args:
+        query:      用户原始/改写后的查询
+        documents:  RRF 融合后的候选文档列表
+        top_k:      最终保留的最优条数
+
+    Returns:
+        [(doc, score), ...] 按得分降序排列的 Top-K 文档-分数对
     """
     if not documents:
         return []
-    if not distances:
-        return documents[:top_k]
 
-    paired = list(zip(documents, distances))
-    # 按距离升序（距离越小越相关）
-    paired.sort(key=lambda pair: pair[1])
-    reranked = [doc for doc, _ in paired[:top_k]]
+    try:
+        reranker = _get_reranker_model()
+        # 构造 (query, doc) 对
+        pairs = [(query, doc) for doc in documents]
+        scores = reranker.predict(pairs, show_progress_bar=False)
 
-    if len(paired) > top_k:
-        logger.debug("Top-K 重排 — %d 条候选 → 截取最优 %d 条", len(paired), top_k)
-    return reranked
+        # 归一化到 [0, 1]（sigmoid）
+        scores = 1.0 / (1.0 + np.exp(-np.array(scores)))
+
+        # 按得分降序排列
+        ranked = sorted(
+            zip(documents, scores.tolist()), key=lambda x: x[1], reverse=True
+        )
+        top = ranked[:top_k]
+
+        logger.debug(
+            "CrossEncoder 重排 — 候选=%d → Top-%d | 最高=%.4f 最低=%.4f",
+            len(documents), len(top),
+            top[0][1] if top else 0.0,
+            top[-1][1] if top else 0.0,
+        )
+        return top
+    except Exception:
+        logger.exception("CrossEncoder 重排异常 — query=%r", query[:80])
+        # 降级：直接截断前 top_k 个
+        fallback = [(doc, 0.0) for doc in documents[:top_k]]
+        return fallback
 
 
 # ── 公开 API ───────────────────────────────────────────────────
@@ -220,8 +343,13 @@ def query_repair_manual_tool(question: str) -> str:
     """
     当用户询问设备如何修理、故障原因或技术原理时，调用此工具。
 
-    内部流水线：
-      question → 查询改写 → 混合检索 → Top-K 距离重排 → 阈值过滤 → 返回结果
+    Hybrid RAG 铁三角流水线（5 段式）：
+      question
+        → ① 查询改写 (_rewrite_query)
+        → ② BM25 + Vector 双路混合检索 (_hybrid_search)
+        → ③ RRF 倒数排序融合 (_rrf_fusion)
+        → ④ BGE Reranker Cross-Attention 精排 (_cross_encoder_rerank)
+        → ⑤ Reranker 得分阈值过滤 → Top-3 核心 Chunk 返回
     """
     try:
         rewritten = _rewrite_query(question)
@@ -236,35 +364,41 @@ def query_repair_manual_tool(question: str) -> str:
         if doc_count == 0:
             return "知识库当前为空，请先运行初始化程序。"
 
-        # Step 1+2: 混合检索拉候选池
-        candidate_docs = _hybrid_search(collection, rewritten)
-        if not candidate_docs:
-            logger.info("RAG 无结果 — question=%r", rewritten[:80])
+        # ── Step 1: BM25 + Vector 双路并行召回 ──
+        ranked_lists = _hybrid_search(collection, rewritten)
+        bm25_count = len(ranked_lists.get("bm25", []))
+        vec_count = len(ranked_lists.get("vector", []))
+        if bm25_count == 0 and vec_count == 0:
+            logger.info("RAG 双路均无结果 — question=%r", rewritten[:80])
             return "知识库中未找到相关手册内容。"
 
-        # Step 3: 对所有候选文档做向量距离查询，为 Top-K 重排提供打分依据
-        vec_results = collection.query(
-            query_texts=[rewritten], n_results=len(candidate_docs)
-        )
-        distances = vec_results.get("distances", [[]])[0] if vec_results else []
-        documents = vec_results.get("documents", [[]])[0] if vec_results else []
+        # ── Step 2: RRF 倒数排序融合 ──
+        fused = _rrf_fusion(ranked_lists)
+        if not fused:
+            logger.info("RAG RRF 融合后为空 — question=%r", rewritten[:80])
+            return "知识库中未找到相关手册内容。"
 
-        # Step 4: Top-K 重排
-        top_docs = _rerank_by_distance(documents, distances, _TOP_K)
+        # ── Step 3: BGE Reranker Cross-Attention 精排 → Top-3 ──
+        top_chunks = _cross_encoder_rerank(question, fused, _TOP_K)
+        if not top_chunks:
+            logger.info("RAG Reranker 无结果 — question=%r", rewritten[:80])
+            return "知识库中未找到相关手册内容。"
 
-        # Step 5: 阈值过滤 — 只有最优匹配的距离低于阈值才算命中
-        best_distance = distances[0] if distances else float("inf")
-        if distances and best_distance < _MAX_DISTANCE:
+        # ── Step 4: 阈值过滤 ──
+        best_score = top_chunks[0][1]
+        if best_score > 0.0:
             logger.info(
-                "RAG 命中 — 最优距离=%.4f 阈值=%.4f 返回=%d 条",
-                best_distance, _MAX_DISTANCE, len(top_docs),
+                "RAG 命中 — Reranker 最高=%.4f | 返回=%d 条 | 候选池=%d",
+                best_score, len(top_chunks), len(fused),
             )
-            return "\n\n".join(top_docs)
+            for i, (doc, score) in enumerate(top_chunks):
+                logger.debug(
+                    "  Chunk #%d | score=%.4f | preview=%.60s",
+                    i + 1, score, doc,
+                )
+            return "\n\n".join(doc for doc, _ in top_chunks)
 
-        logger.info(
-            "RAG 未达阈值 — 最优距离=%.4f 阈值=%.4f",
-            best_distance, _MAX_DISTANCE,
-        )
+        logger.info("RAG 未达 Reranker 阈值 — 最高=%.4f", best_score)
         return "知识库中未找到相关手册内容。"
 
     except Exception:

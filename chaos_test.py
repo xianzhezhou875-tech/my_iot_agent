@@ -30,7 +30,8 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from main_graph import app as agent_graph, workflow
 
 # ── 常量 ───────────────────────────────────────────────────────
-CP_DB = r"D:\my_agent_checkpoints\checkpoint.db"
+_PROJ_ROOT = os.path.dirname(os.path.abspath(__file__))
+CP_DB = os.path.join(_PROJ_ROOT, "data", "checkpoints", "checkpoint.db")
 THREAD_COUNT = 5           # 并发线程数
 CONCURRENT_TIMEOUT = 45.0  # 并发测试超时（秒）
 LOG_SEP = "=" * 55

@@ -12,7 +12,8 @@ import os
 import sys
 
 # ── 常量 ──────────────────────────────────────────────
-LOG_DIR = r"D:/my_agent_logs"
+_LOG_PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR = os.path.join(_LOG_PROJECT_ROOT, "logs")
 LOG_FILENAME = "runtime.log"
 LOG_PATH = os.path.join(LOG_DIR, LOG_FILENAME)
 BACKUP_COUNT = 30  # 保留最近 30 个轮转切片

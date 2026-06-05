@@ -416,9 +416,9 @@ workflow.add_edge("manual_tools", "manual_agent")
 workflow.add_edge("rewriter", "auditor")
 
 # ── HITL 持久化快照底座（SqliteSaver + WAL） ──
-# MemorySaver → SqliteSaver 迁移：将中断状态持久化到 D 盘 SQLite，
-# 进程重启后状态不丢失。WAL 模式 + busy_timeout 全面防御高并发锁死。
-_CP_DIR = r"D:\my_agent_checkpoints"
+# 快照存储在项目目录下 data/checkpoints/，随项目迁移。
+# WAL 模式 + busy_timeout 全面防御高并发锁死。
+_CP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "checkpoints")
 os.makedirs(_CP_DIR, exist_ok=True)
 logger.info("HITL 快照目录已就绪: %s", _CP_DIR)
 
