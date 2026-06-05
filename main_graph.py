@@ -6,14 +6,17 @@ LangGraph 多智能体编排图 — IoT 运维 Agent 核心调度引擎。
   supervisor → manual_agent ⇄ manual_tools → auditor ⇄ rewriter → END
 """
 
+import os
 import re
+import sqlite3
 from typing import Annotated, Literal, Optional
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
-from langgraph.types import Command
+from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.types import Command, interrupt
 from typing_extensions import TypedDict
 
 from database_worker import query_user_device_tool
@@ -182,13 +185,61 @@ def supervisor_node(state: AgentState) -> Command:
         target = _heuristic_route(user_text)
 
     logger.info("Supervisor 路由 → %s", target)
+
+    # ── HITL 门禁：高危路由需人工确认 ──
+    # interrupt() 暂停图执行，将当前 State 写入 checkpointer；
+    # 外部通过 Command(resume=<value>) 恢复，返回值即 resume 传入的值。
+    human_decision = interrupt({
+        "gate": "supervisor_routing",
+        "question": user_text,
+        "proposed_target": target,
+        "message": (
+            f"Supervisor 建议路由到 {target}。"
+            "回复 'y' 确认，或输入 'device_agent'/'manual_agent' 覆盖。"
+        ),
+    })
+
+    # 处理人工覆盖
+    if isinstance(human_decision, dict):
+        override = human_decision.get("override")
+        if override in ("device_agent", "manual_agent"):
+            logger.info(
+                "人工覆盖路由: %s → %s",
+                target, override,
+            )
+            target = override
+    elif isinstance(human_decision, str):
+        decision_lower = human_decision.strip().lower()
+        if decision_lower in ("device_agent", "manual_agent"):
+            logger.info("人工覆盖路由(文本): %s", decision_lower)
+            target = decision_lower
+
+    logger.info("Supervisor 最终路由（经 HITL 确认）→ %s", target)
     return Command(goto=target)
 
 
 # ── 设备专家 ────────────────────────────────────────────────────
 
 def device_agent_node(state: AgentState) -> dict:
-    """设备专家 — 查询用户名下 IoT 设备归属。"""
+    """设备专家 — 查询用户名下 IoT 设备归属（含 HITL 门禁）。"""
+    user_question = _last_user_text(state["messages"])
+
+    # ── HITL 门禁：设备查询前人工确认 ──
+    approval = interrupt({
+        "gate": "device_query_confirm",
+        "question": user_question,
+        "message": "即将查询设备数据库。回复 'y' 继续，或 'skip' 跳过。",
+    })
+
+    if isinstance(approval, dict) and approval.get("action") == "skip":
+        logger.info("人工跳过设备查询: %s", user_question[:80])
+        return {
+            "messages": [AIMessage(
+                content="设备查询已被人工跳过，请告知需要什么帮助。"
+            )]
+        }
+
+    logger.info("设备查询 HITL 确认通过，继续执行")
     messages = _agent_messages(state, DEVICE_AGENT_SYSTEM)
     response = _safe_llm_invoke(_device_model, messages, "device_agent")
     return {"messages": [response]}
@@ -205,7 +256,25 @@ def route_after_device(state: AgentState) -> str:
 # ── 手册专家 ────────────────────────────────────────────────────
 
 def manual_agent_node(state: AgentState) -> dict:
-    """手册专家 — 检索维修手册 & 技术原理。"""
+    """手册专家 — 检索维修手册 & 技术原理（含 HITL 门禁）。"""
+    user_question = _last_user_text(state["messages"])
+
+    # ── HITL 门禁：RAG 检索前人工确认 ──
+    approval = interrupt({
+        "gate": "manual_query_confirm",
+        "question": user_question,
+        "message": "即将检索维修手册知识库。回复 'y' 继续，或 'skip' 跳过。",
+    })
+
+    if isinstance(approval, dict) and approval.get("action") == "skip":
+        logger.info("人工跳过手册检索: %s", user_question[:80])
+        return {
+            "messages": [AIMessage(
+                content="手册检索已被人工跳过，请告知需要什么帮助。"
+            )]
+        }
+
+    logger.info("手册检索 HITL 确认通过，继续执行")
     messages = _agent_messages(state, MANUAL_AGENT_SYSTEM)
     response = _safe_llm_invoke(_manual_model, messages, "manual_agent")
     return {"messages": [response]}
@@ -346,21 +415,54 @@ workflow.add_edge("device_tools", "device_agent")
 workflow.add_edge("manual_tools", "manual_agent")
 workflow.add_edge("rewriter", "auditor")
 
-app = workflow.compile()
-# 调用时传 config={"recursion_limit": 30}，防止异常图结构死循环
+# ── HITL 持久化快照底座（SqliteSaver + WAL） ──
+# MemorySaver → SqliteSaver 迁移：将中断状态持久化到 D 盘 SQLite，
+# 进程重启后状态不丢失。WAL 模式 + busy_timeout 全面防御高并发锁死。
+_CP_DIR = r"D:\my_agent_checkpoints"
+os.makedirs(_CP_DIR, exist_ok=True)
+logger.info("HITL 快照目录已就绪: %s", _CP_DIR)
+
+_conn = sqlite3.connect(
+    os.path.join(_CP_DIR, "checkpoint.db"),
+    timeout=10.0,             # 数据库锁等待上限（秒）
+    check_same_thread=False,  # FastAPI 多 worker 线程安全
+)
+_conn.execute("PRAGMA journal_mode=WAL;")
+_conn.execute("PRAGMA busy_timeout=5000;")   # 5 秒忙等待（毫秒）
+logger.info("SqliteSaver 已连接 — WAL 模式 activated | busy_timeout=5000ms")
+
+_checkpointer = SqliteSaver(_conn)
+app = workflow.compile(checkpointer=_checkpointer)
+# interrupt() 机制天然防止死循环，recursion_limit 不再需要手动传
 
 
 # ── 本地调试入口 ───────────────────────────────────────────────
 
 if __name__ == "__main__":
+    """
+    HITL 双段式状态机本地调试入口。
+
+    双段式的含义：
+      - 「冻结段」→ interrupt() 触发，GraphInterrupt 异常抛出，State 写入 checkpointer。
+      - 「复活段」→ Command(resume=<value>) 重新 invoke，从冻结点恢复执行。
+
+    每条 HITL 门禁 = 一次冻结 + 一次复活，多个门禁 = 多轮循环。
+    本查询 "传感器 100 度正常吗" 预期路径：
+      supervisor(冻结→复活) → manual_agent(冻结→复活) → tools → auditor → END
+    """
     from logging_config import configure_logging
     configure_logging()
 
     from database_worker import init_db
     from rag_worker import init_rag
+    from langgraph.errors import GraphInterrupt
 
     init_db()
     init_rag()
+
+    # ── 调试会话配置 ──
+    # checkpointer 靠 thread_id 区分不同会话快照，多轮 resume 必须用同一个 ID。
+    config = {"configurable": {"thread_id": "debug-hitl-001"}}
 
     msg = HumanMessage(
         content=(
@@ -368,6 +470,78 @@ if __name__ == "__main__":
             "并且把你在向量库中查询到的内容告诉我不管匹不匹配"
         )
     )
-    result = app.invoke({"messages": [msg], "rewrite_count": 0})
-    last = result["messages"][-1].content
-    logger.info("AI 回复: %s", last if isinstance(last, str) else str(last))
+
+    logger.info("=" * 55)
+    logger.info("HITL 多段式状态机调试启动 | thread_id=%s", config["configurable"]["thread_id"])
+    logger.info("查询: %s", msg.content[:70])
+    logger.info("=" * 55)
+
+    # ═════════════════════════════════════════════════════════════
+    # 阶段-1：首次 invoke → 预期冻结在 supervisor 路由门禁
+    # ═════════════════════════════════════════════════════════════
+    logger.info("[阶段-1] 首次 invoke，预期冻结在 supervisor 路由门禁...")
+
+    try:
+        result = app.invoke(
+            {"messages": [msg], "rewrite_count": 0},
+            config=config,
+        )
+        # 防御：某些 LangGraph 版本不抛 GraphInterrupt，而是静默写入返回值
+        interrupted = isinstance(result, dict) and "__interrupt__" in result
+        if interrupted:
+            logger.info("[阶段-1] ✅ 静默挂起 — __interrupt__ 字段已检测到")
+        else:
+            logger.info("[阶段-1] ⚠️ 未触发任何门禁，图直接跑完（是否没装 checkpointer？）")
+            last_content = result["messages"][-1].content
+            logger.info("最终回复: %s", last_content[:200] if isinstance(last_content, str) else str(last_content)[:200])
+    except GraphInterrupt:
+        logger.info("[阶段-1] ✅ GraphInterrupt 捕获 — supervisor 路由门禁已挂起")
+
+        # ═════════════════════════════════════════════════════════
+        # 阶段-2：确认路由 → 复活 → 预期冻结在 expert 执行门禁
+        # ═════════════════════════════════════════════════════════
+        logger.info("[阶段-2] Command(resume={'action': 'continue'}) 复活中...")
+
+        try:
+            result = app.invoke(
+                Command(resume={"action": "continue"}),
+                config=config,
+            )
+            interrupted2 = isinstance(result, dict) and "__interrupt__" in result
+            if interrupted2:
+                logger.info("[阶段-2] ✅ 静默挂起 — __interrupt__ 字段检测到")
+            else:
+                logger.info("[阶段-2] ⚠️ 未触发二次门禁，图直接完成")
+                last_content = result["messages"][-1].content
+                logger.info("最终回复: %s", last_content[:200] if isinstance(last_content, str) else str(last_content)[:200])
+        except GraphInterrupt:
+            logger.info("[阶段-2] ✅ GraphInterrupt 捕获 — expert 执行门禁已挂起")
+
+            # ═════════════════════════════════════════════════════
+            # 阶段-3：确认 expert 执行 → 最终复活 → 冲向终局
+            # ═════════════════════════════════════════════════════
+            logger.info("[阶段-3] Command(resume={'action': 'continue'}) 最终复活...")
+
+            try:
+                result = app.invoke(
+                    Command(resume={"action": "continue"}),
+                    config=config,
+                )
+                logger.info("[阶段-3] ✅ 图执行完成，无更多门禁中断")
+
+                final_msg = result["messages"][-1]
+                content = final_msg.content
+                content_str = content if isinstance(content, str) else str(content)
+
+                logger.info("=" * 55)
+                logger.info("AI 最终回复:\n%s", content_str)
+                logger.info("=" * 55)
+                logger.info(
+                    "统计 | 消息总数=%d | 重写次数=%d",
+                    len(result["messages"]),
+                    result.get("rewrite_count", 0),
+                )
+            except GraphInterrupt:
+                logger.info("[阶段-3] ⚠️ 仍有未预期的门禁挂起 — 请检查是否新增了 interrupt()")
+            except Exception:
+                logger.exception("[阶段-3] 非预期异常")
