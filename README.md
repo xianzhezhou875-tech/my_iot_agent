@@ -1,17 +1,58 @@
-# my_iot_agent
-• 项目背景：针对物联网设备运维资料冗余、故障诊断难的问题，独立设计并开发了一款具备跨会话记忆与混合检索能力的智能诊断 Agent，实现设备排障自动化。 
+# 🤖 IoT RAG Agent Assistant (基于 LangGraph + FastAPI 的全栈工业级 HITL 智能体系统)
 
-• 技术架构：采用 LangGraph 构建 ReAct 循环架构，后端使用 FastAPI 封装标准异步 API，前端基于 Streamlit 构建轻量级交互界面，整体服务基于 Docker 实现容器化部署。 
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
+[![Framework LangGraph](https://img.shields.io/badge/Framework-LangGraph_2.0-orange.svg)](https://github.com/langchain-ai/langgraph)
+[![Backend FastAPI](https://img.shields.io/badge/Backend-FastAPI-green.svg)](https://fastapi.tiangolo.com/)
+[![License MIT](https://img.shields.io/badge/license-MIT-red.svg)](./LICENSE)
 
-• 核心功能与工程亮点： 
+这是一个专门针对物联网（IoT）复杂业务场景设计的、具备高防御性与准生产级交付水准的 **Advanced RAG 智能体助理系统**。系统底层依托 **LangGraph 2.0** 状态机拓扑构建，彻底解决了传统线性 Chain 结构在面对高危动作执行、高并发访问、状态长效持久化以及长文本幻觉时的工程痛点。
 
-o [智能体架构] Runtime Auditor 与自我纠错 突破单向链式调用限制，基于 LangGraph 设计多节点循环架构，创新性引入“运行时审计 (Auditor)”与“强制重写 (Rewriter)”机制。通过后置校验有效拦截 LLM 幻觉，确保输出的维修方案 100% 具备可追溯的参考来源 (Grounding)。 
+---
 
-o [混合知识检索] 结构化与非结构化数据融合 封装 ChromaDB 实现维修手册的向量语义检索（基于 sentence-transformers）；结合 SQLite 实现设备运行状态的 SQL 关联查询。通过 Function Calling 动态路由，实现业务数据与外部知识的精准匹配。 
+## 🏗️ 系统核心架构拓扑
 
-o [生产级工程落地] 高可用后端与规范化部署 
- ▪ 接口规范与防御性编程：基于 Pydantic 建立严格的数据契约 (Data Contract)；引入 try-except 全局异常捕获与 pythondotenv 环境变量管理，确保大模型接口超时情况下的服务鲁棒性。 
- ▪ 全链路可观测性：深度接入 LangSmith 实现 Agent 内部节点调用的全链路追踪 (Tracing)，并构建基于 logging 模块的系统运行日志，实现从网络请求到 Agent 思考链路的快速 Bug 溯源。 
- ▪ 容器化敏捷交付：编写高可用 Dockerfile，并使用 Docker Compose 统筹 Agent 后端服务、向量数据库与前端 UI 组件，实现环境隔离与跨平台的一键式部署。 
- 
-o [质量评测体系] 自动化反馈闭环 自主构建 Golden Dataset (基准测试集)，搭建 Agent 自动化评测流水线 (Evaluation Pipeline)。针对检索准确率 (Retrieval) 与回答事实性 (Groundedness) 进行量化打分，驱动 Prompt 与工作流的持续迭代优化。
+本系统在研发过程中深度践行**“网络感知层与业务状态机彻底解耦”**的原则，整体拓扑架构如下：
+
+
+
+### 1. 状态机级 HITL 门禁网络 (Human-in-the-Loop)
+系统依托 LangGraph 内置的刚性 `interrupt()` 语法，在业务链路上架设了 3 处完全独立的防御卡口：
+* **HITL-1 (路由分流确认门)**：对主管 Agent（Supervisor）的分流决策进行安全审计。
+* **HITL-2 (高危动作执行门)**：针对下发至具体 IoT 设备的控制指令进行人工二次授权。
+* **HITL-3 (知识检索内容门)**：对长文本检索召回的核心金块进行合规性阻断审查。
+
+### 2. 双端全异步解冻协议 (Stateless To Stateful Contract)
+* **网络感应拦截**：FastAPI 路由层在 `/chat` 接口内部异步捕捉底层抛出的 `GraphInterrupt` 异常，秒级释放 HTTP 请求线程，杜绝高并发网关 I/O 阻塞。
+* **无损唤醒反哺**：独立开辟 `/api/approve` 二次握手解冻路由，前端复用同一条 `session_id` 作为线程指针钥匙，利用 `Command(resume=...)` 信号注入器精准注入干预信号，打通全异步审批流。
+
+---
+
+## 💾 持久化底座与并发防御 (Resilient Storage)
+
+为了保障挂起现场的绝对灾备安全，系统全面废弃了脆皮的内存缓存（MemorySaver），重构升级为 **`SqliteSaver` 物理快照城堡**，并注入了三层并发防御机制：
+
+* **`journal_mode=WAL` (预写日志模式)**：强行打通物理读写分离，确保读不掉线、写不互斥。
+* **`busy_timeout=5000ms` (写锁排队机制)**：全面防御多用户、多线程高并发抢占操作同一个 `.db` 文件时的 `Database is locked` 毁灭性崩溃。
+* **`check_same_thread=False`**：彻底封杀了 Python 在多线程异步环境下操作 SQLite 的跨线程安全隐患。
+* **跨进程原位复活**：快照数据刚性写入 `D:\my_agent_checkpoints\checkpoint.db`，即使后端服务器突发断电、进程遭 `taskkill` 强杀，重启后依然能完美捞出中断现场，实现“断电免密原地复活”。
+
+---
+
+## 🔬 检索大脑：Advanced RAG 铁三角流水线
+
+针对传统 RAG 极易发生的“型号幻觉（如模糊 V1/V2 混淆）”与长文本“迷失在中间（Lost in the Middle）”效应，本系统手写重构了原生函数级的检索增强流水线：
+
+```text
+用户提问 (Query)
+   │
+   ├──> [Dense 路] ChromaDB 密集向量检索 ───> 捕捉模糊语义意图
+   └──> [Sparse 路] BM25Okapi 稀疏关键词 ──> 精确匹配强特征(如设备型号)
+   │
+   ▼
+[RFF 倒数排序融合] ──> 公式: 1 / (60 + Rank) 抹平不同量纲分数 ──> 免密去重提权
+   │
+   ▼
+[BGE-Reranker v2-m3] ──> 懒加载常驻内存 + 交叉注意力 Cross-Attention 精排
+   │
+   ▼
+[Sigmoid 阈值熔断] ──> 映射置信度区间至 0-1 ──> 剔除脏数据 ──> 截断 Top-3 精华灌入 LLM
