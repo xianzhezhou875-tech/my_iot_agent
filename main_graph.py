@@ -9,15 +9,15 @@ LangGraph 多智能体编排图 — IoT 运维 Agent 核心调度引擎。
 import os
 import re
 import sqlite3
-from typing import Annotated, Literal, Optional
+import operator
+from typing import Literal, Optional
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.graph import END, StateGraph
-from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import Command, interrupt
-from typing_extensions import TypedDict
+from typing_extensions import Annotated, TypedDict
 
 from database_worker import query_user_device_tool
 from llm_factory import (
@@ -36,8 +36,8 @@ MAX_REWRITE_ATTEMPTS = 2
 
 # ── 状态定义 ───────────────────────────────────────────────────
 
-class AgentState(TypedDict):
-    messages: Annotated[list, add_messages]
+class MessagesState(TypedDict):
+    messages: Annotated[list[AnyMessage], operator.add]
     rewrite_count: int
 
 
@@ -79,7 +79,7 @@ def _last_assistant_reply_text(messages: list) -> str:
     return ""
 
 
-def _agent_messages(state: AgentState, system_prompt: str) -> list:
+def _agent_messages(state: MessagesState, system_prompt: str) -> list:
     """
     构建专家节点的消息列表：
     系统 Prompt 打头 + 对话历史（剔除其他专家的 SystemMessage 避免角色冲突）。
@@ -155,7 +155,7 @@ def _heuristic_route(user_text: str) -> Literal["device_agent", "manual_agent"]:
     return target
 
 
-def supervisor_node(state: AgentState) -> Command:
+def supervisor_node(state: MessagesState) -> Command:
     """
     经理节点 — 分析用户意图，按需分诊（dispatch /dɪˈspætʃ/）到设备专家或手册专家。
 
@@ -220,7 +220,7 @@ def supervisor_node(state: AgentState) -> Command:
 
 # ── 设备专家 ────────────────────────────────────────────────────
 
-def device_agent_node(state: AgentState) -> dict:
+def device_agent_node(state: MessagesState) -> dict:
     """设备专家 — 查询用户名下 IoT 设备归属（含 HITL 门禁）。"""
     user_question = _last_user_text(state["messages"])
 
@@ -245,7 +245,7 @@ def device_agent_node(state: AgentState) -> dict:
     return {"messages": [response]}
 
 
-def route_after_device(state: AgentState) -> str:
+def route_after_device(state: MessagesState) -> str:
     """设备专家后路由：有 tool_call → 执行工具，否则 → 结束。"""
     last_msg = state["messages"][-1]
     if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
@@ -255,7 +255,7 @@ def route_after_device(state: AgentState) -> str:
 
 # ── 手册专家 ────────────────────────────────────────────────────
 
-def manual_agent_node(state: AgentState) -> dict:
+def manual_agent_node(state: MessagesState) -> dict:
     """手册专家 — 检索维修手册 & 技术原理（含 HITL 门禁）。"""
     user_question = _last_user_text(state["messages"])
 
@@ -280,7 +280,7 @@ def manual_agent_node(state: AgentState) -> dict:
     return {"messages": [response]}
 
 
-def route_after_manual(state: AgentState) -> str:
+def route_after_manual(state: MessagesState) -> str:
     """手册专家后路由：有 tool_call → 执行工具 → auditor 质检。"""
     last_msg = state["messages"][-1]
     if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
@@ -308,7 +308,7 @@ def _audit_passed(raw: str) -> bool:
     return True
 
 
-def node_audit_answer(state: AgentState) -> Command:
+def node_audit_answer(state: MessagesState) -> Command:
     """
     审计节点 — 核对 AI 最终回答是否忠于 RAG 参考资料。
 
@@ -349,7 +349,7 @@ def node_audit_answer(state: AgentState) -> Command:
     return Command(goto="rewriter")
 
 
-def node_rewrite(state: AgentState) -> dict:
+def node_rewrite(state: MessagesState) -> dict:
     """
     重写节点 — 审计未通过时，强制基于 RAG 原始资料重新生成回答。
 
@@ -380,7 +380,7 @@ def node_rewrite(state: AgentState) -> dict:
 
 # ── 图构建 ──────────────────────────────────────────────────────
 
-workflow = StateGraph(AgentState)
+workflow = StateGraph(MessagesState)
 
 workflow.add_node(
     "supervisor",

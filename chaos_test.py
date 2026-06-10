@@ -58,7 +58,7 @@ def _config(thread_id: str) -> dict:
 
 
 def _state(question: str) -> dict:
-    """构建初始 AgentState。"""
+    """构建初始 MessagesState。"""
     return {
         "messages": [HumanMessage(content=question)],
         "rewrite_count": 0,
